@@ -8,7 +8,7 @@ Uses only Python standard library (`urllib.request`, `http.cookiejar`, `re`) —
 
 ## Prerequisites
 
-- Python 3.8+
+- Python 3.10+
 
 ## Installation
 
