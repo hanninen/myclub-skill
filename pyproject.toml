@@ -1,0 +1,18 @@
+[project]
+name = "myclub"
+version = "0.1.0"
+description = "Fetch sports schedules from myclub.fi"
+requires-python = ">=3.8"
+dependencies = [
+    "playwright",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.5",
+    "ruff>=0.15.6",
+]
+
