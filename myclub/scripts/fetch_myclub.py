@@ -69,7 +69,7 @@ class MyclubSession:
         self.last_html = None
 
     def get(self, url: str) -> str:
-        resp = self.opener.open(url)
+        resp = self.opener.open(url, timeout=30)
         self.last_url = resp.url
         self.last_html = resp.read().decode("utf-8")
         return self.last_html
@@ -591,11 +591,16 @@ def is_date_in_range_finnish(date_str: str, start_date: str, end_date: str) -> b
             return True
         day = int(parts[0])
         month = int(parts[1])
-        current_year = datetime.now().year
-        date_obj = datetime(current_year, month, day).date()
         start_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
         end_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
-        return start_obj <= date_obj <= end_obj
+        for year in range(start_obj.year, end_obj.year + 1):
+            try:
+                date_obj = datetime(year, month, day).date()
+            except ValueError:
+                continue
+            if start_obj <= date_obj <= end_obj:
+                return True
+        return False
     except (ValueError, AttributeError, IndexError):
         return True
 
