@@ -1,11 +1,40 @@
 ---
 name: myclub
 description: Fetch accounts' sports schedules, practices, games, and events from myclub.fi. Auto-discovers accounts and clubs from your myclub.fi account. Use for checking practice times and locations, finding upcoming games and matches, viewing club events, or getting schedule summaries. Requires myclub.fi credentials (stored locally).
+metadata:
+  clawdbot:
+    version: "1.0.0"
+    author: "hanninen"
+    homepage: "https://github.com/hanninen/myclub-skill"
+requires:
+  runtime: "python3"
+  python: ">=3.10"
+files: ["scripts/*"]
 ---
 
 # myclub Skill
 
 Fetch sports schedules from myclub.fi, including practice times, game dates, locations, and registration status.
+
+## External Endpoints
+
+This skill connects to the following external services:
+
+- `id.myclub.fi` — Authentication (login via form POST with CSRF token)
+- `*.myclub.fi` — Fetching club pages and event schedules (each club has its own subdomain)
+
+No other external services are contacted.
+
+## Security & Privacy
+
+- **Credentials**: Your myclub.fi email and password are stored locally in `~/.myclub-config.json` with owner-only permissions (`0600`). They are never sent anywhere other than `id.myclub.fi` for authentication.
+- **Data flow**: Login credentials are sent to `id.myclub.fi` over HTTPS. Schedule data is fetched from `*.myclub.fi` over HTTPS. No data is sent to any third party.
+- **No telemetry**: This skill does not collect analytics, telemetry, or usage data.
+- **Local only**: All parsed schedule data is returned to the calling agent and is not stored or transmitted elsewhere.
+
+## Trust Statement
+
+Data that leaves your machine: your myclub.fi email and password are sent to `id.myclub.fi` for authentication. Schedule data is fetched from `*.myclub.fi`. No data is sent to any other service. Only install this skill if you trust myclub.fi with your credentials.
 
 ## Setup (one-time)
 
@@ -61,4 +90,4 @@ python3 scripts/fetch_myclub.py fetch --account "Account Name" [--period PERIOD 
 
 ## Requirements
 
-Python 3.8+ (no external dependencies — uses only standard library).
+Python 3.10+ (no external dependencies — uses only standard library).

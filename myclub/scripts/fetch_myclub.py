@@ -6,6 +6,13 @@ Usage:
     python3 fetch_myclub.py setup --username USER --password PASS
     python3 fetch_myclub.py discover
     python3 fetch_myclub.py fetch --account Kaarlo --period "this week"
+
+Security manifest:
+    Config accessed: ~/.myclub-config.json (read/write, mode 0600)
+    External endpoints:
+        - https://id.myclub.fi  (authentication: login form POST)
+        - https://*.myclub.fi   (data fetch: club pages, event schedules)
+    No other network calls. No telemetry. No data sent to third parties.
 """
 
 import html as html_mod
