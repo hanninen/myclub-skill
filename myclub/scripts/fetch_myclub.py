@@ -21,6 +21,13 @@ from datetime import datetime, timedelta
 
 CONFIG_FILE = Path.home() / ".myclub-config.json"
 
+_quiet = False
+
+def _print(*args, **kwargs):
+    """Print to stdout unless quiet mode is enabled (JSON output)."""
+    if not _quiet:
+        print(*args, **kwargs)
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -38,8 +45,8 @@ def save_config(username: str, password: str):
     config = {"username": username, "password": password}
     CONFIG_FILE.write_text(json.dumps(config, indent=2))
     CONFIG_FILE.chmod(0o600)
-    print(f"✓ Credentials saved to {CONFIG_FILE}")
-    print("✓ Run 'discover' to see available accounts and clubs")
+    _print(f"✓ Credentials saved to {CONFIG_FILE}")
+    _print("✓ Run 'discover' to see available accounts and clubs")
 
 # ---------------------------------------------------------------------------
 # HTTP session
@@ -152,6 +159,12 @@ def _extract_data_events(html: str) -> list:
     except json.JSONDecodeError:
         return []
 
+
+def _extract_details_url(html: str) -> str | None:
+    """Extract the event details API URL from data-url attribute."""
+    m = re.search(r'data-url="([^"]*events/details[^"]*)"', html)
+    return m.group(1) if m else None
+
 def _parse_event_bars(html: str) -> dict:
     """
     Parse event-bar HTML blocks for day, time, and registration status.
@@ -202,7 +215,7 @@ def _parse_event_bars(html: str) -> dict:
 
 def login(session: MyclubSession, username: str, password: str, debug: bool = False) -> bool:
     """Log in to myclub.fi via form POST."""
-    print("Logging in to myclub.fi...")
+    _print("Logging in to myclub.fi...")
 
     html = session.get("https://id.myclub.fi/flow/login")
 
@@ -229,7 +242,7 @@ def login(session: MyclubSession, username: str, password: str, debug: bool = Fa
             _dump_page_debug(session, "/tmp/myclub-login-result")
         return False
 
-    print("  ✓ Login successful")
+    _print("  ✓ Login successful")
     return True
 
 # ---------------------------------------------------------------------------
@@ -282,7 +295,7 @@ def parse_clubs_from_html(html: str) -> dict:
         }
 
     if clubs:
-        print(f"  ✓ Discovered {len(clubs)} account/club combinations")
+        _print(f"  ✓ Discovered {len(clubs)} account/club combinations")
     else:
         print("  No valid account/club links found", file=sys.stderr)
 
@@ -290,7 +303,7 @@ def parse_clubs_from_html(html: str) -> dict:
 
 def discover_clubs(username: str, password: str, debug: bool = False) -> dict:
     """Discover all accounts and their clubs."""
-    print("Discovering accounts and clubs...")
+    _print("Discovering accounts and clubs...")
 
     session = MyclubSession()
     if not login(session, username, password, debug=debug):
@@ -338,10 +351,51 @@ def infer_event_type(category: str, name: str) -> str:
 # Schedule fetching & parsing
 # ---------------------------------------------------------------------------
 
+def _fetch_event_details(session, events_url: str, details_path: str,
+                         initial_html: str, start_date: str, end_date: str,
+                         debug: bool = False) -> dict:
+    """Fetch event details (day/time) from the details API endpoint."""
+    # Get all event IDs from data-events, filtered to the requested range
+    all_events = _extract_data_events(initial_html)
+    event_ids = []
+    for ev in all_events:
+        month_str = ev.get("month", "")
+        if not month_str:
+            continue
+        try:
+            month_parts = month_str.split("-")
+            month_date = datetime(int(month_parts[0]), int(month_parts[1]), 1).date()
+            month_end = (datetime(int(month_parts[0]), int(month_parts[1]), 1)
+                         + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+            if is_month_in_range(month_date, month_end.date(), start_date, end_date):
+                event_ids.append(str(ev["id"]))
+        except (ValueError, IndexError, KeyError):
+            continue
+
+    if not event_ids:
+        return {}
+
+    # Build the details URL
+    parsed = urllib.parse.urlparse(events_url)
+    base = f"{parsed.scheme}://{parsed.netloc}{details_path}"
+    ids_str = ",".join(event_ids)
+    details_url = f"{base}?ids={ids_str}"
+
+    _print(f"  Fetching day/time for {len(event_ids)} events...")
+    try:
+        html = session.get(details_url)
+        if debug:
+            _dump_page_debug(session, "/tmp/myclub-event-details")
+        return _parse_event_bars(html)
+    except Exception as e:
+        print(f"    Warning: could not fetch event details: {e}", file=sys.stderr)
+        return {}
+
+
 def fetch_schedule(username: str, password: str, account_name: str,
                    start_date: str, end_date: str, debug: bool = False) -> dict:
     """Fetch schedule from myclub.fi."""
-    print(f"Fetching schedule for {account_name}...")
+    _print(f"Fetching schedule for {account_name}...")
 
     session = MyclubSession()
     if not login(session, username, password, debug=debug):
@@ -361,16 +415,31 @@ def fetch_schedule(username: str, password: str, account_name: str,
     club_name = club_info["name"]
     club_url = club_info["url"]
 
-    print(f"  ✓ Found {account_name} -> {club_name}")
+    _print(f"  ✓ Found {account_name} -> {club_name}")
 
     # Navigate to club — select_account redirects to the events page
     session.get(club_url)
+    initial_html = session.last_html
+    events_url = session.last_url
 
     if debug:
         _dump_page_debug(session, "/tmp/myclub-events-page")
 
-    print("  Parsing events...")
-    events = parse_events_from_html(session.last_html, start_date, end_date)
+    # Collect event bars (day/time) from the page
+    html_event_data = _parse_event_bars(initial_html)
+
+    # If no event bars on initial page, fetch details via API
+    if not html_event_data:
+        details_path = _extract_details_url(initial_html)
+        if details_path:
+            html_event_data = _fetch_event_details(
+                session, events_url, details_path, initial_html,
+                start_date, end_date, debug=debug,
+            )
+
+    _print("  Parsing events...")
+    events = parse_events_from_html(initial_html, start_date, end_date,
+                                    html_event_data=html_event_data)
 
     return {
         "account": account_name,
@@ -380,7 +449,8 @@ def fetch_schedule(username: str, password: str, account_name: str,
         "events": events,
     }
 
-def parse_events_from_html(html: str, start_date: str, end_date: str) -> list:
+def parse_events_from_html(html: str, start_date: str, end_date: str,
+                           html_event_data: dict | None = None) -> list:
     """
     Parse events from schedule page HTML.
 
@@ -391,12 +461,13 @@ def parse_events_from_html(html: str, start_date: str, end_date: str) -> list:
     events = []
 
     # Step 1: Parse event-bar HTML for day/time/registration
-    html_event_data = _parse_event_bars(html)
-    print(f"    Found {len(html_event_data)} events with day/time in HTML")
+    if html_event_data is None:
+        html_event_data = _parse_event_bars(html)
+    _print(f"    Found {len(html_event_data)} events with day/time in HTML")
 
     # Step 2: Parse data-events JSON
     events_data = _extract_data_events(html)
-    print(f"    Found {len(events_data)} events in data-events JSON")
+    _print(f"    Found {len(events_data)} events in data-events JSON")
 
     # Step 3: Build events from JSON, enriched with HTML data
     json_event_ids = set()
@@ -504,7 +575,7 @@ def parse_events_from_html(html: str, start_date: str, end_date: str) -> list:
         return (99, 99, "")
 
     unique_events.sort(key=sort_key)
-    print(f"    {len(unique_events)} unique events total")
+    _print(f"    {len(unique_events)} unique events total")
     return unique_events
 
 # ---------------------------------------------------------------------------
@@ -622,7 +693,8 @@ Examples:
     setup.add_argument("--username", required=True, help="myclub.fi email")
     setup.add_argument("--password", required=True, help="myclub.fi password")
 
-    subparsers.add_parser("discover", help="List accounts and clubs")
+    discover = subparsers.add_parser("discover", help="List accounts and clubs")
+    discover.add_argument("--json", action="store_true", help="JSON output")
 
     fetch = subparsers.add_parser("fetch", help="Fetch schedule")
     fetch.add_argument("--account", required=True, help="Account name")
@@ -637,19 +709,25 @@ Examples:
         save_config(args.username, args.password)
 
     elif args.command == "discover":
+        global _quiet
+        _quiet = args.json
         config = load_config()
         clubs = discover_clubs(config["username"], config["password"], debug=args.debug)
         if not clubs:
             print("No clubs found", file=sys.stderr)
             sys.exit(1)
-        print("\n📚 Available accounts and clubs:\n")
-        for account, info in clubs.items():
-            print(f"  {account}:")
-            print(f"    Club: {info['name']}")
-            print(f"    URL: {info['url']}")
-            print()
+        if args.json:
+            print(json.dumps(clubs, indent=2, ensure_ascii=False))
+        else:
+            _print("\n📚 Available accounts and clubs:\n")
+            for account, info in clubs.items():
+                _print(f"  {account}:")
+                _print(f"    Club: {info['name']}")
+                _print(f"    URL: {info['url']}")
+                _print()
 
     elif args.command == "fetch":
+        _quiet = args.json
         config = load_config()
         start_date, end_date = (args.start, args.end) if args.start and args.end else parse_period(args.period)
         schedule = fetch_schedule(
@@ -657,7 +735,7 @@ Examples:
             start_date, end_date, debug=args.debug,
         )
         if args.json:
-            print(json.dumps(schedule, indent=2))
+            print(json.dumps(schedule, indent=2, ensure_ascii=False))
         else:
             print(format_output(schedule))
 

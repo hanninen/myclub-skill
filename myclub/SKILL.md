@@ -22,8 +22,10 @@ Credentials are stored in `~/.myclub-config.json` with owner-only permissions (`
 List all available accounts and their clubs.
 
 ```bash
-python3 scripts/fetch_myclub.py discover
+python3 scripts/fetch_myclub.py discover [--json]
 ```
+
+**`--json`**: Output JSON instead of formatted text
 
 ### fetch
 
@@ -44,10 +46,11 @@ python3 scripts/fetch_myclub.py fetch --account "Account Name" [--period PERIOD 
 | `group` | Team or group (e.g., "P2015 Black") |
 | `venue` | Location |
 | `month` | First day of event's month (YYYY-MM-DD) |
+| `day` | Day in Finnish format (e.g., "15.3."), or `null` if unavailable |
+| `time` | Time range (e.g., "17:00 - 18:00"), or `null` if unavailable |
 | `event_category` | `Harjoitus` (training), `Ottelu` (game), `Turnaus` (tournament), `Muu` (other) |
 | `type` | Inferred: `training`, `game`, `tournament`, `meeting`, `other` |
-
-**Note:** Data has month-level granularity only — exact times require visiting myclub.fi directly.
+| `registration_status` | Registration status text from myclub.fi, or `"unknown"` |
 
 ## Troubleshooting
 
