@@ -58,8 +58,4 @@ python3 scripts/fetch_myclub.py fetch --account "Account Name" [--period PERIOD 
 
 ## Requirements
 
-Python 3.8+ with Playwright:
-
-```bash
-pip install playwright && playwright install
-```
+Python 3.8+ (no external dependencies — uses only standard library).

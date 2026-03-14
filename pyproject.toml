@@ -3,9 +3,7 @@ name = "myclub"
 version = "0.1.0"
 description = "Fetch sports schedules from myclub.fi"
 requires-python = ">=3.8"
-dependencies = [
-    "playwright",
-]
+dependencies = []
 
 [tool.uv]
 package = false
@@ -13,6 +11,7 @@ package = false
 [dependency-groups]
 dev = [
     "pytest>=8.3.5",
+    "pytest-cov>=5.0.0",
     "ruff>=0.15.6",
 ]
 

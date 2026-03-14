@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fetch myclub.fi schedules for accounts using Playwright.
+Fetch myclub.fi schedules using standard library HTTP requests.
 
 Usage:
     python3 fetch_myclub.py setup --username USER --password PASS
@@ -8,15 +8,22 @@ Usage:
     python3 fetch_myclub.py fetch --account Kaarlo --period "this week"
 """
 
+import html as html_mod
+import http.cookiejar
 import json
+import re
 import sys
 import argparse
-import re
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from datetime import datetime, timedelta
-from playwright.sync_api import sync_playwright
 
 CONFIG_FILE = Path.home() / ".myclub-config.json"
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 def load_config():
     """Load credentials from config."""
@@ -30,226 +37,278 @@ def save_config(username: str, password: str):
     """Save credentials (accounts/clubs auto-discovered)."""
     config = {"username": username, "password": password}
     CONFIG_FILE.write_text(json.dumps(config, indent=2))
-    CONFIG_FILE.chmod(0o600)  # Owner read/write only
+    CONFIG_FILE.chmod(0o600)
     print(f"✓ Credentials saved to {CONFIG_FILE}")
     print("✓ Run 'discover' to see available accounts and clubs")
 
-def _find_visible(page, selectors: list[str]) -> str | None:
-    """Return the first selector that matches a visible element, or None."""
-    for sel in selectors:
-        try:
-            if page.locator(sel).first.is_visible():
-                return sel
-        except Exception:
-            pass
-    return None
+# ---------------------------------------------------------------------------
+# HTTP session
+# ---------------------------------------------------------------------------
 
-def _dump_inputs(page, file=sys.stderr):
-    """Print all input elements on the page for debugging."""
-    inputs = page.locator("input").all()
-    for i, inp in enumerate(inputs):
-        attrs = {
-            "type": inp.get_attribute("type") or "text",
-            "id": inp.get_attribute("id") or "",
-            "name": inp.get_attribute("name") or "",
-            "placeholder": inp.get_attribute("placeholder") or "",
-            "visible": inp.is_visible(),
-        }
-        print(f"    [{i}] {attrs}", file=file)
+class MyclubSession:
+    """HTTP session with cookie support for myclub.fi."""
 
-def login_to_myclub(page, username: str, password: str, debug: bool = False) -> bool:
-    """Log in to myclub.fi. The login page is server-rendered with static fields."""
-    print("🔓 Logging in to myclub.fi...")
+    def __init__(self):
+        self.cookie_jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.cookie_jar),
+            urllib.request.HTTPRedirectHandler(),
+        )
+        self.opener.addheaders = [
+            ("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) myclub-skill/0.1"),
+            ("Accept", "text/html,application/xhtml+xml"),
+        ]
+        self.last_url = None
+        self.last_html = None
 
-    page.goto("https://id.myclub.fi/flow/login", wait_until="networkidle")
-    print("  ✓ Login page loaded")
+    def get(self, url: str) -> str:
+        resp = self.opener.open(url)
+        self.last_url = resp.url
+        self.last_html = resp.read().decode("utf-8")
+        return self.last_html
 
-    if debug:
-        page.screenshot(path="/tmp/myclub-login-debug.png")
-        print("  📸 Screenshot saved to /tmp/myclub-login-debug.png")
+    def post(self, url: str, data: dict) -> str:
+        encoded = urllib.parse.urlencode(data).encode("utf-8")
+        req = urllib.request.Request(url, data=encoded, method="POST")
+        resp = self.opener.open(req)
+        self.last_url = resp.url
+        self.last_html = resp.read().decode("utf-8")
+        return self.last_html
 
-    # Find and fill email
-    email_selector = _find_visible(page, [
-        "#user_session_email",
-        "input[name='user_session[email]']",
-        "input[type='email']",
-    ])
-    if not email_selector:
-        print("  ✗ Email field not found!", file=sys.stderr)
-        if debug:
-            _dump_inputs(page)
-        return False
+    def cookies_as_list(self) -> list:
+        return [
+            {"name": c.name, "value": c.value, "domain": c.domain, "path": c.path}
+            for c in self.cookie_jar
+        ]
 
-    page.fill(email_selector, username)
+# ---------------------------------------------------------------------------
+# Debug
+# ---------------------------------------------------------------------------
 
-    # Find and fill password
-    password_selector = _find_visible(page, [
-        "#user_session_password",
-        "input[name='user_session[password]']",
-        "input[type='password']",
-    ])
-    if not password_selector:
-        print("  ✗ Password field not found!", file=sys.stderr)
-        if debug:
-            page.screenshot(path="/tmp/myclub-password-debug.png")
-            print("  📸 Screenshot saved to /tmp/myclub-password-debug.png", file=sys.stderr)
-            _dump_inputs(page)
-        return False
+def _dump_page_debug(session: MyclubSession, prefix: str):
+    """Save page state for debugging: HTML, URL, and cookies."""
+    html = session.last_html or ""
+    print(f"\n  DEBUG: Page state dump ({prefix})", file=sys.stderr)
+    print(f"  URL: {session.last_url}", file=sys.stderr)
 
-    page.fill(password_selector, password)
+    Path(f"{prefix}.html").write_text(html)
+    print(f"  HTML ({len(html)} chars): {prefix}.html", file=sys.stderr)
 
-    # Submit
-    button_selector = _find_visible(page, [
-        "button[type='submit']",
-        "button.btn-primary",
-    ])
-    if not button_selector:
-        print("  ✗ Login button not found!", file=sys.stderr)
-        return False
+    cookies = session.cookies_as_list()
+    Path(f"{prefix}-cookies.json").write_text(json.dumps(cookies, indent=2))
+    print(f"  Cookies ({len(cookies)}): {prefix}-cookies.json", file=sys.stderr)
 
-    page.click(button_selector)
+    # Structure summary
+    print("  Structure summary:", file=sys.stderr)
+    for pattern, label in [
+        (r"data-events=", "data-events divs"),
+        (r'class="[^"]*event-bar[^"]*"', "event bars"),
+        (r'class="[^"]*event-container[^"]*"', "event containers"),
+        (r"select_account", "account links"),
+    ]:
+        count = len(re.findall(pattern, html))
+        if count > 0:
+            print(f"    {label}: {count}", file=sys.stderr)
 
-    # Wait for post-login navigation
+    # Sample data-events JSON
+    events_json = _extract_data_events(html)
+    if events_json:
+        print(f"    data-events JSON: {len(events_json)} events", file=sys.stderr)
+        print(f"    Sample event keys: {list(events_json[0].keys())}", file=sys.stderr)
+        print(f"    Sample event: {json.dumps(events_json[0], indent=6, ensure_ascii=False)}", file=sys.stderr)
+
+    # Sample event-bar
+    bar_match = re.search(r'<div class="event-bar".*?</div>', html, re.DOTALL)
+    if bar_match:
+        print(f"    Sample event-bar HTML: {bar_match.group()[:300]}", file=sys.stderr)
+
+    print(f"  END DEBUG\n", file=sys.stderr)
+
+# ---------------------------------------------------------------------------
+# HTML parsing helpers
+# ---------------------------------------------------------------------------
+
+def _extract_csrf_token(html: str) -> str | None:
+    """Extract Rails CSRF token from hidden input or meta tag."""
+    # Try hidden input first (more specific to the form)
+    m = re.search(r'<input[^>]*name="authenticity_token"[^>]*value="([^"]+)"', html)
+    if m:
+        return m.group(1)
+    # Fallback to meta tag
+    m = re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"', html)
+    if not m:
+        m = re.search(r'<meta\s+content="([^"]+)"\s+name="csrf-token"', html)
+    return m.group(1) if m else None
+
+def _extract_data_events(html: str) -> list:
+    """Extract events JSON from data-events attribute."""
+    m = re.search(r'data-events="([^"]*)"', html)
+    if not m:
+        return []
+    raw = html_mod.unescape(m.group(1))
     try:
-        page.wait_for_url("**/id.myclub.fi**", timeout=15000)
-    except Exception:
-        print("  ⚠️  Navigation didn't match expected URL, continuing...", file=sys.stderr)
+        data = json.loads(raw)
+        return data if isinstance(data, list) else [data]
+    except json.JSONDecodeError:
+        return []
 
-    page.wait_for_load_state("networkidle")
+def _parse_event_bars(html: str) -> dict:
+    """
+    Parse event-bar HTML blocks for day, time, and registration status.
+
+    Returns: {event_id: {"day": "15.3.", "time": "12:35 - 14:30", "registration_status": "..."}}
+    """
+    results = {}
+    # Split by event-container divs
+    blocks = re.split(r'<div class="event-container">', html)
+    for block in blocks[1:]:
+        # Event ID from href="#event-content-NNNN"
+        id_m = re.search(r'href="#event-content-(\d+)"', block)
+        if not id_m:
+            continue
+        event_id = int(id_m.group(1))
+
+        # Day: <span class="day"> su 15.3. </span>
+        day = None
+        day_m = re.search(r'<span class="day">\s*(.*?)\s*</span>', block, re.DOTALL)
+        if day_m:
+            parts = day_m.group(1).strip().split()
+            day = parts[-1] if parts else None
+
+        # Time: <span class="time"> 12:35 - 14:30 </span>
+        time_val = None
+        time_m = re.search(r'<span class="time">\s*(.*?)\s*</span>', block, re.DOTALL)
+        if time_m:
+            time_val = time_m.group(1).strip()
+
+        # Registration status: <span class="registration-times"><span>...</span>
+        reg_status = "unknown"
+        reg_m = re.search(r'<span class="registration-times"><span>(.*?)</span>', block)
+        if reg_m:
+            reg_status = reg_m.group(1).strip()
+
+        if event_id and (day or time_val):
+            results[event_id] = {
+                "day": day,
+                "time": time_val,
+                "registration_status": reg_status,
+            }
+
+    return results
+
+# ---------------------------------------------------------------------------
+# Login
+# ---------------------------------------------------------------------------
+
+def login(session: MyclubSession, username: str, password: str, debug: bool = False) -> bool:
+    """Log in to myclub.fi via form POST."""
+    print("Logging in to myclub.fi...")
+
+    html = session.get("https://id.myclub.fi/flow/login")
+
+    csrf = _extract_csrf_token(html)
+    if not csrf:
+        print("  Error: CSRF token not found on login page", file=sys.stderr)
+        if debug:
+            _dump_page_debug(session, "/tmp/myclub-login")
+        return False
+
+    # Form posts to /flow/user_session (Rails resource route)
+    session.post("https://id.myclub.fi/flow/user_session", {
+        "utf8": "\u2713",
+        "authenticity_token": csrf,
+        "user_session[email]": username,
+        "user_session[password]": password,
+        "commit": "Kirjaudu sisään",
+    })
+
+    # Check if we landed on the home page (successful login)
+    if "/flow/home" not in (session.last_url or ""):
+        print("  Error: Login failed — did not reach home page", file=sys.stderr)
+        if debug:
+            _dump_page_debug(session, "/tmp/myclub-login-result")
+        return False
+
     print("  ✓ Login successful")
-
     return True
 
-def discover_clubs(username: str, password: str, debug: bool = False) -> dict:
+# ---------------------------------------------------------------------------
+# Club discovery
+# ---------------------------------------------------------------------------
+
+def parse_clubs_from_html(html: str) -> dict:
     """
-    Discover all accounts and their clubs.
+    Parse accounts and clubs from home page HTML.
 
-    Returns:
-    {
-        "Kaarlo": {"name": "FC Kasiysi", "url": "https://..."},
-        "Helmi": {"name": "Gymnast Club A", "url": "https://..."}
-    }
-    """
-    print("🔍 Discovering accounts and clubs...")
-    
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page()
-        # Set default timeout for operations (5 seconds)
-        page.set_default_timeout(5000)
-        
-        try:
-            if not login_to_myclub(page, username, password, debug=debug):
-                print("Error: Login failed", file=sys.stderr)
-                return {}
-
-            # We should be at id.myclub.fi/flow/home
-            print("📋 Reading clubs list...")
-            page.wait_for_load_state("networkidle")
-            
-            # Parse clubs from the page
-            clubs = parse_clubs_from_page(page)
-            
-        finally:
-            browser.close()
-    
-    return clubs
-
-def parse_clubs_from_page(page) -> dict:
-    """
-    Parse accounts and clubs from home page.
-
-    Link format:
-    - text: "Kaarlo Hänninen" (account's full name)
-    - href: "https://fckasiysi.myclub.fi/flow/select_account?id=889307"
-    - club name: extracted from subdomain (fckasiysi → FC Kasiysi)
+    Link format: <a href="https://fckasiysi.myclub.fi/flow/select_account?id=889307">Kaarlo Hänninen</a>
     """
     clubs = {}
-    
-    # Find all links to club subdomains
-    links = page.locator("a[href*='myclub.fi']").all()
-    
-    print(f"  Found {len(links)} club links")
-    
-    if not links:
-        return clubs
-    
-    # Parse links: each should have an account name and club URL
-    seen_combos = set()  # Track (account_name, subdomain) to avoid duplicates
-    
-    for link in links:
-        href = link.get_attribute("href")
-        text = link.text_content().strip()
-        
-        # Skip empty or short text
-        if not href or not text or len(text) < 2:
+    seen_combos = set()
+
+    links = re.findall(
+        r'<a[^>]*href="(https?://([a-z0-9-]+)\.myclub\.fi/flow/select_account\?id=\d+)"[^>]*>(.*?)</a>',
+        html, re.DOTALL,
+    )
+
+    for url, subdomain, raw_text in links:
+        # Clean HTML tags from link text (some links contain <label>, <img>, <p> etc.)
+        text = re.sub(r"<[^>]+>", "", raw_text).strip()
+        if len(text) < 2:
             continue
-        
-        # Skip navigation links and links without select_account
-        if href.endswith("/flow/") or "select_account" not in href:
-            continue
-        
-        # Extract club subdomain from URL
-        # e.g., "https://fckasiysi.myclub.fi/..." → "fckasiysi"
-        url_match = re.search(r'https?://([a-z0-9-]+)\.myclub\.fi', href)
-        if not url_match:
-            continue
-        
-        club_subdomain = url_match.group(1)
-        
-        # Extract account name from text
-        # Text is usually "Firstname Lastname" or just first name
+
         name_parts = text.split()
         if not name_parts:
             continue
 
         account_name = name_parts[0].strip()
 
-        # Skip duplicate (account, subdomain) combinations
-        combo = (account_name, club_subdomain)
+        combo = (account_name, subdomain)
         if combo in seen_combos:
             continue
         seen_combos.add(combo)
 
-        # Human-readable club name from subdomain
-        club_display_name = format_club_name(club_subdomain)
+        club_display_name = format_club_name(subdomain)
 
-        # Use first name as key; if account has multiple clubs, add subdomain to key
         if account_name in clubs:
-            # Account has multiple clubs - add subdomain to key for uniqueness
-            key = f"{account_name} ({club_subdomain})"
+            key = f"{account_name} ({subdomain})"
         else:
-            # First club for this account
             key = account_name
-        
+
         clubs[key] = {
             "name": club_display_name,
-            "url": href,
-            "subdomain": club_subdomain,
-            "full_name": text
+            "url": url,
+            "subdomain": subdomain,
+            "full_name": text,
         }
-    
-    if clubs:
-        print(f"  ✓ Discovered {len(clubs)} account/club combinations", file=sys.stderr)
-        return clubs
 
-    print("  ⚠️  No valid account/club links found", file=sys.stderr)
-    return {}
+    if clubs:
+        print(f"  ✓ Discovered {len(clubs)} account/club combinations")
+    else:
+        print("  No valid account/club links found", file=sys.stderr)
+
+    return clubs
+
+def discover_clubs(username: str, password: str, debug: bool = False) -> dict:
+    """Discover all accounts and their clubs."""
+    print("Discovering accounts and clubs...")
+
+    session = MyclubSession()
+    if not login(session, username, password, debug=debug):
+        return {}
+
+    if debug:
+        _dump_page_debug(session, "/tmp/myclub-home-page")
+
+    return parse_clubs_from_html(session.last_html)
+
+# ---------------------------------------------------------------------------
+# Event type inference
+# ---------------------------------------------------------------------------
 
 def format_club_name(subdomain: str) -> str:
-    """
-    Format club subdomain to readable name.
-    
-    Examples:
-    - fckasiysi → FC Kasiysi
-    - esjt → ESJT
-    - htkd → HTKD
-    """
-    # If it's all lowercase and looks like an acronym, uppercase it
+    """Format club subdomain to readable name."""
     if subdomain.islower() and len(subdomain) <= 6:
         return subdomain.upper()
-    
-    # Otherwise capitalize first letter of each word
     return " ".join(word.capitalize() for word in subdomain.split("-"))
 
 def infer_event_type(category: str, name: str) -> str:
@@ -275,433 +334,205 @@ def infer_event_type(category: str, name: str) -> str:
         return "meeting"
     return "training"
 
-def fetch_schedule(username: str, password: str, account_name: str, start_date: str, end_date: str, debug: bool = False) -> dict:
-    """
-    Fetch schedule from myclub.fi.
-    """
-    print(f"📅 Fetching schedule for {account_name}...")
+# ---------------------------------------------------------------------------
+# Schedule fetching & parsing
+# ---------------------------------------------------------------------------
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page()
-        # Set default timeout for operations (5 seconds)
-        page.set_default_timeout(5000)
+def fetch_schedule(username: str, password: str, account_name: str,
+                   start_date: str, end_date: str, debug: bool = False) -> dict:
+    """Fetch schedule from myclub.fi."""
+    print(f"Fetching schedule for {account_name}...")
 
-        try:
-            if not login_to_myclub(page, username, password, debug=debug):
-                print("Error: Login failed", file=sys.stderr)
-                return {"account": account_name, "club": "", "events": []}
+    session = MyclubSession()
+    if not login(session, username, password, debug=debug):
+        return {"account": account_name, "club": "", "events": []}
 
-            # Discover clubs
-            print(f"🏟️  Looking for {account_name}'s club...")
-            page.wait_for_load_state("networkidle")
+    if debug:
+        _dump_page_debug(session, "/tmp/myclub-home-page")
 
-            clubs = parse_clubs_from_page(page)
+    clubs = parse_clubs_from_html(session.last_html)
 
-            if account_name not in clubs:
-                print(f"Error: '{account_name}' not found", file=sys.stderr)
-                print(f"Available: {', '.join(clubs.keys())}", file=sys.stderr)
-                return {"account": account_name, "club": "", "events": []}
+    if account_name not in clubs:
+        print(f"Error: '{account_name}' not found", file=sys.stderr)
+        print(f"Available: {', '.join(clubs.keys())}", file=sys.stderr)
+        return {"account": account_name, "club": "", "events": []}
 
-            club_info = clubs[account_name]
-            club_name = club_info["name"]
-            club_url = club_info["url"]
+    club_info = clubs[account_name]
+    club_name = club_info["name"]
+    club_url = club_info["url"]
 
-            print(f"  ✓ Found {account_name} → {club_name}")
-            print(f"  ✓ Navigating to {club_url}...")
+    print(f"  ✓ Found {account_name} -> {club_name}")
 
-            # Navigate to club page
-            page.goto(club_url, wait_until="networkidle")
+    # Navigate to club — select_account redirects to the events page
+    session.get(club_url)
 
-            print("📅 Parsing events...")
-            page.wait_for_load_state("networkidle")
+    if debug:
+        _dump_page_debug(session, "/tmp/myclub-events-page")
 
-            # Parse events from schedule page
-            events = parse_events_from_page(page, start_date, end_date)
+    print("  Parsing events...")
+    events = parse_events_from_html(session.last_html, start_date, end_date)
 
-            return {
-                "account": account_name,
-                "club": club_name,
-                "start_date": start_date,
-                "end_date": end_date,
-                "events": events
-            }
-            
-        finally:
-            browser.close()
-
-def parse_events_from_page(page, start_date: str, end_date: str) -> list:
-    """
-    Parse events from schedule page using embedded JSON data + HTML day/time info.
-    
-    The page contains: 
-    1. <div data-events='[{"id":..,"name":"..","group":"..","venue":"..","month":"YYYY-MM-DD","event_category":".."}]'>
-    2. HTML structure with actual day/time:
-       <div class="event-container">
-         <div class="event-bar" href="#event-content-ID">
-           <span class="day">pe 13.3.</span>
-           <span class="time">17:00 - 19:00</span>
-    
-    JSON Structure (month level only):
-    {
-        "id": integer,
-        "name": string (event name),
-        "group": string (team/group name),
-        "venue": string (location),
-        "month": string (YYYY-MM-DD, first day of month),
-        "event_category": string (Muu, Harjoitus, Ottelu, Turnaus)
+    return {
+        "account": account_name,
+        "club": club_name,
+        "start_date": start_date,
+        "end_date": end_date,
+        "events": events,
     }
-    
-    HTML Structure (actual day + time):
-    <div class="event-bar" data-toggle="collapse" href="#event-content-ID">
-      <span class="day">pe 13.3.</span>
-      <span class="time">17:00 - 19:00</span>
-    </div>
+
+def parse_events_from_html(html: str, start_date: str, end_date: str) -> list:
+    """
+    Parse events from schedule page HTML.
+
+    Data sources:
+    1. data-events JSON attribute: {id, name, group, venue, month, event_category}
+    2. event-bar HTML blocks: day, time, registration status
     """
     events = []
-    html_event_data = {}  # Will map event ID to {day, time, name, venue, group}
-    
-    print("  📋 Looking for data-events JSON...")
-    
-    try:
-        # Step 1: Parse HTML to get day/time info for each event ID
-        print("  🔍 Extracting day and time from HTML...")
-        html_event_data = parse_event_times_from_html(page)
-        print(f"  ✓ Found {len(html_event_data)} events with day/time in HTML")
-        
-        # Step 2: Find the div with data-events attribute (may not have id="events")
-        if page.locator("[data-events]").count() == 0:
-            print("  ⚠️  No data-events JSON found, using HTML data only")
-            events_data = []
-        else:
-            # Get the data-events attribute
-            data_events_str = page.locator("[data-events]").first.get_attribute("data-events")
-            if not data_events_str:
-                print("  ⚠️  No data-events attribute found, using HTML data only")
-                events_data = []
-            else:
-                print(f"  ✓ Found data-events (length: {len(data_events_str)} chars)")
-                
-                # Parse JSON
-                try:
-                    events_data = json.loads(data_events_str)
-                    
-                    if not isinstance(events_data, list):
-                        events_data = [events_data]
-                    
-                    print(f"  ✓ Parsed {len(events_data)} events from JSON")
-                except json.JSONDecodeError as e:
-                    print(f"  ✗ Failed to parse JSON: {str(e)[:60]}")
-                    events_data = []
-        
-        # Extract relevant fields from JSON events
-        json_event_ids = set()
-        for event_data in events_data:
-            try:
-                # Get basic info
-                name = event_data.get("name", "").strip()
-                if not name:
-                    continue
-                
-                event_id = event_data.get("id")
-                if event_id:
-                    json_event_ids.add(event_id)
-                
-                # Parse month (format: YYYY-MM-DD, first day of month)
-                month_str = event_data.get("month", "").strip()
-                if not month_str:
-                    continue
-                
-                # Extract year and month from "YYYY-MM-DD"
-                try:
-                    month_parts = month_str.split('-')
-                    year = int(month_parts[0])
-                    month = int(month_parts[1])
-                except (ValueError, IndexError):
-                    print(f"  ⚠️  Could not parse month: {month_str}")
-                    continue
-                
-                # Check if month is in range (use first day of month for comparison)
-                month_date = datetime(year, month, 1).date()
-                month_end_dt = (datetime(year, month, 1) + timedelta(days=32)).replace(day=1) - timedelta(days=1)
-                month_end = month_end_dt.date()
-                
-                if not is_month_in_range(month_date, month_end, start_date, end_date):
-                    continue
-                
-                # Get location
-                venue = event_data.get("venue", "").strip()
-                
-                # Get group/team info
-                group = event_data.get("group", "").strip()
-                
-                event_type = infer_event_type(event_data.get("event_category", ""), name)
-                
-                # Step 3: Merge with HTML day/time data if available
-                day = None
-                time = None
-                if event_id and event_id in html_event_data:
-                    day = html_event_data[event_id].get("day")
-                    time = html_event_data[event_id].get("time")
-                
-                event = {
-                    "id": event_id,
-                    "name": name,
-                    "group": group,
-                    "venue": venue,
-                    "month": month_str,
-                    "day": day,  # Actual day from HTML (e.g., "pe 13.3.")
-                    "time": time,  # Actual time from HTML (e.g., "17:00 - 19:00")
-                    "event_category": event_data.get("event_category", ""),
-                    "type": event_type,
-                    "registration_status": "unknown"
-                }
-                
-                events.append(event)
-            
-            except Exception as e:
-                print(f"  ⚠️  Error parsing event: {str(e)[:50]}")
-                continue
-        
-        # Step 4: Add HTML-only events (not in JSON data)
-        # These are events that only appear in HTML but not in data-events JSON
-        if html_event_data:
-            print("  📋 Processing HTML-only events...")
-            for event_id, html_data in html_event_data.items():
-                # Skip if already in JSON
-                if event_id in json_event_ids:
-                    continue
-                
-                day = html_data.get("day")
-                time = html_data.get("time")
-                
-                # Check if day is in requested range
-                if day and not is_date_in_range_finnish(day, start_date, end_date):
-                    continue
-                
-                # Create minimal event from HTML data
-                name = html_data.get("name", f"Event {event_id}")
-                venue = html_data.get("venue", "")
-                group = html_data.get("group", "")
-                
-                event_type = infer_event_type("", name)
-                
-                event = {
-                    "id": event_id,
-                    "name": name,
-                    "group": group,
-                    "venue": venue,
-                    "month": None,  # Unknown from HTML
-                    "day": day,
-                    "time": time,
-                    "event_category": None,
-                    "type": event_type,
-                    "registration_status": "unknown"
-                }
-                
-                events.append(event)
-                print(f"    ✓ Added HTML-only event: {name} ({day})")
-    
-    except Exception as e:
-        print(f"  ✗ Error: {str(e)[:60]}")
-        return []
-    
-    # Remove duplicates (same id or same name+venue+day)
+
+    # Step 1: Parse event-bar HTML for day/time/registration
+    html_event_data = _parse_event_bars(html)
+    print(f"    Found {len(html_event_data)} events with day/time in HTML")
+
+    # Step 2: Parse data-events JSON
+    events_data = _extract_data_events(html)
+    print(f"    Found {len(events_data)} events in data-events JSON")
+
+    # Step 3: Build events from JSON, enriched with HTML data
+    json_event_ids = set()
+    for event_data in events_data:
+        name = event_data.get("name", "").strip()
+        if not name:
+            continue
+
+        event_id = event_data.get("id")
+        if event_id:
+            json_event_ids.add(event_id)
+
+        month_str = event_data.get("month", "").strip()
+        if not month_str:
+            continue
+
+        try:
+            month_parts = month_str.split("-")
+            year = int(month_parts[0])
+            month = int(month_parts[1])
+        except (ValueError, IndexError):
+            continue
+
+        month_date = datetime(year, month, 1).date()
+        month_end = (datetime(year, month, 1) + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+        month_end = month_end.date()
+
+        if not is_month_in_range(month_date, month_end, start_date, end_date):
+            continue
+
+        # Merge with HTML data
+        day = None
+        time_val = None
+        reg_status = "unknown"
+        if event_id and event_id in html_event_data:
+            bar = html_event_data[event_id]
+            day = bar.get("day")
+            time_val = bar.get("time")
+            reg_status = bar.get("registration_status", "unknown")
+
+        events.append({
+            "id": event_id,
+            "name": name,
+            "group": event_data.get("group", "").strip(),
+            "venue": event_data.get("venue", "").strip(),
+            "month": month_str,
+            "day": day,
+            "time": time_val,
+            "event_category": event_data.get("event_category", ""),
+            "type": infer_event_type(event_data.get("event_category", ""), name),
+            "registration_status": reg_status,
+        })
+
+    # Step 4: Add HTML-only events (not in JSON data)
+    for event_id, bar_data in html_event_data.items():
+        if event_id in json_event_ids:
+            continue
+
+        day = bar_data.get("day")
+        time_val = bar_data.get("time")
+
+        if day and not is_date_in_range_finnish(day, start_date, end_date):
+            continue
+
+        name = bar_data.get("name", f"Event {event_id}")
+        events.append({
+            "id": event_id,
+            "name": name,
+            "group": bar_data.get("group", ""),
+            "venue": bar_data.get("venue", ""),
+            "month": None,
+            "day": day,
+            "time": time_val,
+            "event_category": None,
+            "type": infer_event_type("", name),
+            "registration_status": bar_data.get("registration_status", "unknown"),
+        })
+
+    # Deduplicate
     seen = set()
     unique_events = []
     for e in events:
-        # Use event ID if available, otherwise use name+venue+day
         key = e.get("id") or (e["name"], e.get("venue"), e.get("day"))
         if key not in seen:
             seen.add(key)
             unique_events.append(e)
-    
-    # Sort by day/time if available, otherwise by month and name
+
+    # Sort by day/time, then by month
     def sort_key(e):
         if e.get("day"):
-            # Parse day like "13.3." to sort properly
             try:
-                day_str = e["day"].rstrip('.')  # Remove trailing dot: "13.3" 
-                day_parts = day_str.split('.')
+                day_str = e["day"].rstrip(".")
+                day_parts = day_str.split(".")
                 day_num = int(day_parts[0])
                 month_num = int(day_parts[1]) if len(day_parts) > 1 else 1
-                time_val = e.get("time", "00:00")
-                return (month_num, day_num, time_val)
-            except:
+                return (month_num, day_num, e.get("time", "00:00"))
+            except (ValueError, IndexError):
                 pass
-        
-        # Fallback: parse month from e["month"] (YYYY-MM-DD format)
-        try:
-            month_str = e.get("month", "")
-            if month_str:
-                month_parts = month_str.split('-')
-                year = int(month_parts[0])
-                month = int(month_parts[1])
-                return (month, 1, e.get("name", ""))
-        except:
-            pass
-        
+        if e.get("month"):
+            try:
+                parts = e["month"].split("-")
+                return (int(parts[1]), 1, e.get("name", ""))
+            except (ValueError, IndexError):
+                pass
         return (99, 99, "")
-    
+
     unique_events.sort(key=sort_key)
-    
-    print(f"  ✓ Extracted {len(unique_events)} unique events total")
-    
+    print(f"    {len(unique_events)} unique events total")
     return unique_events
 
-
-def parse_event_times_from_html(page) -> dict:
-    """
-    Parse HTML to extract actual day and time for each event.
-    
-    Structure:
-    <div class="event-bar" data-toggle="collapse" href="#event-content-ID">
-      <span class="day">pe 13.3.</span>
-      <span class="time">17:00 - 19:00</span>
-    </div>
-    
-    Returns: {event_id: {"day": "13.3.", "time": "17:00 - 19:00"}, ...}
-    Note: Strips Finnish weekday abbreviation (pe, ma, ti, ke, to, la, su)
-    """
-    event_times = {}
-    
-    try:
-        # Set shorter timeout for HTML parsing
-        page.set_default_timeout(2000)
-        
-        # Find all event-bar elements with shorter timeout
-        try:
-            event_bars = page.locator(".event-bar").all()
-        except Exception as e:
-            print(f"  ⚠️  Could not find event bars: {str(e)[:40]}")
-            return event_times
-        
-        if not event_bars:
-            print("  ⚠️  No event bars found in HTML")
-            return event_times
-        
-        for bar in event_bars:
-            try:
-                # Get the href attribute to extract event ID
-                # href format: "#event-content-ID" (e.g., "#event-content-10375030")
-                href = None
-                try:
-                    href = bar.get_attribute("href")
-                except:
-                    try:
-                        href = bar.get_attribute("data-toggle")
-                    except:
-                        pass
-                
-                if not href:
-                    continue
-                
-                # Extract event ID from href
-                event_id = None
-                if "event-content-" in href:
-                    try:
-                        event_id = int(href.split("event-content-")[-1])
-                    except ValueError:
-                        continue
-                
-                # Extract day from <span class="day">
-                day = None
-                try:
-                    day_span = bar.locator("span.day").first
-                    day_text = day_span.text_content().strip()
-                    # Strip weekday abbreviation (format: "pe 13.3.")
-                    # Split by whitespace and take the last part (the date)
-                    parts = day_text.split()
-                    if parts:
-                        # Last part should be the date (e.g., "13.3.")
-                        date_part = parts[-1]
-                        day = date_part
-                except Exception:
-                    # Don't fail if day parsing fails
-                    pass
-                
-                # Extract time from <span class="time">
-                time = None
-                try:
-                    time_span = bar.locator("span.time").first
-                    time = time_span.text_content().strip()
-                except Exception:
-                    # Don't fail if time parsing fails
-                    pass
-                
-                # Store if we have ID and at least day or time
-                if event_id and (day or time):
-                    event_times[event_id] = {
-                        "day": day,
-                        "time": time
-                    }
-            
-            except Exception:
-                # Skip individual events that fail
-                continue
-        
-        # Restore default timeout
-        page.set_default_timeout(5000)
-    
-    except Exception as e:
-        print(f"  ⚠️  Error parsing HTML event times: {str(e)[:50]}")
-        # Restore default timeout on error
-        try:
-            page.set_default_timeout(5000)
-        except:
-            pass
-    
-    return event_times
-
-def is_date_in_range(date_str: str, start_date: str, end_date: str) -> bool:
-    """Check if date (DD.MM) is within range."""
-    try:
-        day, month = map(int, date_str.split('.'))
-        current_year = datetime.now().year
-        date_obj = datetime(current_year, month, day).date()
-        
-        start_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
-        end_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
-        
-        return start_obj <= date_obj <= end_obj
-    except (ValueError, AttributeError):
-        return True
+# ---------------------------------------------------------------------------
+# Date helpers
+# ---------------------------------------------------------------------------
 
 def is_date_in_range_finnish(date_str: str, start_date: str, end_date: str) -> bool:
-    """
-    Check if Finnish date string (e.g., "15.3." or "15.3") is within range.
-    
-    Handles format: DD.M. or DD.M or DD.MM. or DD.MM
-    """
+    """Check if Finnish date string (e.g., "15.3." or "15.3") is within range."""
     try:
-        # Clean up the date string
-        date_clean = date_str.strip().rstrip('.')
-        
-        # Split by dot
-        parts = date_clean.split('.')
+        date_clean = date_str.strip().rstrip(".")
+        parts = date_clean.split(".")
         if len(parts) < 2:
             return True
-        
         day = int(parts[0])
         month = int(parts[1])
-        
         current_year = datetime.now().year
         date_obj = datetime(current_year, month, day).date()
-        
         start_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
         end_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
-        
         return start_obj <= date_obj <= end_obj
     except (ValueError, AttributeError, IndexError):
         return True
 
-def is_month_in_range(month_start: object, month_end: object, start_date: str, end_date: str) -> bool:
-    """Check if a month (start and end dates) overlaps with the requested range."""
+def is_month_in_range(month_start, month_end, start_date: str, end_date: str) -> bool:
+    """Check if a month overlaps with the requested range."""
     try:
         start_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
         end_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
-        
-        # Month overlaps if it doesn't end before start or start after end
         return not (month_end < start_obj or month_start > end_obj)
     except (ValueError, AttributeError):
         return True
@@ -709,23 +540,23 @@ def is_month_in_range(month_start: object, month_end: object, start_date: str, e
 def parse_period(period_str: str) -> tuple:
     """Convert period string to (start_date, end_date)."""
     today = datetime.now().date()
-    
     next_month_first = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
     period_map = {
-        "this week": (today - timedelta(days=today.weekday()), today + timedelta(days=6-today.weekday())),
-        "next week": (today + timedelta(days=7-today.weekday()), today + timedelta(days=13-today.weekday())),
+        "this week": (today - timedelta(days=today.weekday()), today + timedelta(days=6 - today.weekday())),
+        "next week": (today + timedelta(days=7 - today.weekday()), today + timedelta(days=13 - today.weekday())),
         "this month": (today.replace(day=1), (today.replace(day=1) + timedelta(days=32)).replace(day=1) - timedelta(days=1)),
         "next month": (next_month_first, (next_month_first + timedelta(days=32)).replace(day=1) - timedelta(days=1)),
     }
-    
     if period_str.lower() in period_map:
         start, end = period_map[period_str.lower()]
         return str(start), str(end)
-    
-    # Default to this week
     start = today - timedelta(days=today.weekday())
     end = start + timedelta(days=6)
     return str(start), str(end)
+
+# ---------------------------------------------------------------------------
+# Output formatting
+# ---------------------------------------------------------------------------
 
 def format_output(schedule: dict) -> str:
     """Format schedule as human-readable text."""
@@ -738,17 +569,16 @@ def format_output(schedule: dict) -> str:
 
     output = f"📅 {account}'s Schedule ({club})\n"
     output += f"   {schedule['start_date']} to {schedule['end_date']}\n\n"
-    
+
     for event in events:
         emoji = {
             "training": "🏃",
             "game": "⚽",
             "tournament": "🏆",
             "meeting": "👥",
-            "other": "📌"
+            "other": "📌",
         }.get(event["type"], "📌")
-        
-        # Display day/time if available (from HTML), otherwise month
+
         if event.get("day"):
             output += f"{emoji} {event['day']}"
             if event.get("time"):
@@ -756,21 +586,23 @@ def format_output(schedule: dict) -> str:
             output += "\n"
         else:
             output += f"{emoji} {event['month']}\n"
-        
+
         output += f"   {event['name']}\n"
-        
+
         if event.get("group"):
             output += f"   👥 Group: {event['group']}\n"
-        
         if event.get("venue"):
             output += f"   📍 {event['venue']}\n"
-        
         if event.get("event_category"):
             output += f"   📂 {event['event_category']}\n"
-        
+
         output += "\n"
-    
+
     return output
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
@@ -781,65 +613,54 @@ Examples:
   python3 fetch_myclub.py setup --username user@example.com --password pass
   python3 fetch_myclub.py discover
   python3 fetch_myclub.py fetch --account Kaarlo --period "this week"
-        """
+        """,
     )
-    parser.add_argument("--debug", action="store_true", help="Enable debug output (screenshots, input dumps)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug output (HTML dumps, cookies)")
     subparsers = parser.add_subparsers(dest="command", help="Command")
-    
-    # Setup command
+
     setup = subparsers.add_parser("setup", help="Store credentials")
     setup.add_argument("--username", required=True, help="myclub.fi email")
     setup.add_argument("--password", required=True, help="myclub.fi password")
-    
-    # Discover command
-    discover = subparsers.add_parser("discover", help="List accounts and clubs")
-    
-    # Fetch command
+
+    subparsers.add_parser("discover", help="List accounts and clubs")
+
     fetch = subparsers.add_parser("fetch", help="Fetch schedule")
     fetch.add_argument("--account", required=True, help="Account name")
     fetch.add_argument("--period", default="this week", help="Period")
     fetch.add_argument("--start", help="Start date (YYYY-MM-DD)")
     fetch.add_argument("--end", help="End date (YYYY-MM-DD)")
     fetch.add_argument("--json", action="store_true", help="JSON output")
-    
+
     args = parser.parse_args()
-    
+
     if args.command == "setup":
         save_config(args.username, args.password)
-    
+
     elif args.command == "discover":
         config = load_config()
         clubs = discover_clubs(config["username"], config["password"], debug=args.debug)
-        
         if not clubs:
             print("No clubs found", file=sys.stderr)
             sys.exit(1)
-        
         print("\n📚 Available accounts and clubs:\n")
         for account, info in clubs.items():
             print(f"  {account}:")
             print(f"    Club: {info['name']}")
             print(f"    URL: {info['url']}")
             print()
-    
+
     elif args.command == "fetch":
         config = load_config()
         start_date, end_date = (args.start, args.end) if args.start and args.end else parse_period(args.period)
-        
         schedule = fetch_schedule(
-            config["username"],
-            config["password"],
-            args.account,
-            start_date,
-            end_date,
-            debug=args.debug
+            config["username"], config["password"], args.account,
+            start_date, end_date, debug=args.debug,
         )
-        
         if args.json:
             print(json.dumps(schedule, indent=2))
         else:
             print(format_output(schedule))
-    
+
     else:
         parser.print_help()
 
